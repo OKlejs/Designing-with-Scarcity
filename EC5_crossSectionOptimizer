@@ -1,0 +1,1103 @@
+#region Usings
+using System;
+#r "C:\Program Files\Rhino 8\Plug-ins\Karamba\Karamba.gha"
+#r "C:\Program Files\Rhino 8\Plug-ins\Karamba\KarambaCommon.dll"
+
+using System;
+using System.Linq;
+using System.Collections.Generic;
+using Rhino;
+using Rhino.Geometry;
+using Grasshopper;
+using Grasshopper.Kernel;
+using Grasshopper.Kernel.Types;
+using Grasshopper.Kernel.Data;
+using Karamba.Models;
+using Karamba.CrossSections;
+using Karamba.Elements;
+using Karamba.Results;
+using Karamba.Geometry;
+using Karamba.Joints;
+using System.Text;
+#endregion
+
+public class Script_Instance : GH_ScriptInstance
+{
+  /*
+    ─────────────────────────────────────────────────────────────────────────────────
+    PHASED OPTIMIZATION WITH AUTOMATED JOINT ASSESSMENT
+    ─────────────────────────────────────────────────────────────────────────────────
+    This script implements a phased optimization approach:
+    
+    Phase 1A: Initial optimization with all joints pinned
+    Phase 1B: Joint stiffness categorization (R/Y/G logic) with automated thresholds
+    Phase 2: Semi-rigid optimization with target stiffnesses
+    Final: Joint evaluation and reporting
+    
+    The script accounts for force redistribution and joint behavior in timber structures.
+    ─────────────────────────────────────────────────────────────────────────────────
+  */
+
+  // Partial factor (EC5, typically ~1.3)
+  private const double GAMMA_M = 1.3;
+  
+  // Material property lists (populated from input)
+  private List<double> charFmValues = new List<double>();
+  private List<double> charFcValues = new List<double>();
+  private List<double> charFtValues = new List<double>();
+  private List<double> charTValues = new List<double>();
+
+  // Pre-calculated design strengths for all sections
+  private List<double> designFmValues = new List<double>();
+  private List<double> designFcValues = new List<double>();
+  private List<double> designFtValues = new List<double>();
+  private List<double> designTValues = new List<double>();
+  
+  // Cache cross-section properties for faster access
+  private List<double> sectionAreas = new List<double>();
+  private List<double> sectionWelY = new List<double>();
+
+  // =================== CLASSES ===================
+
+  // Enhanced Joint Assessment class with specific recommendations
+  private class JointAssessment
+  {
+      public int NodeIndex { get; set; }
+      public string Category { get; set; } // "RED", "YELLOW", "GREEN"
+      public double MaxMoment { get; set; }
+      public double MaxAxial { get; set; }
+      public double MaxShear { get; set; }
+      public List<int> ConnectedElements { get; set; }
+      public double MinAngle { get; set; } // Minimum angle between members
+      public string Recommendation { get; set; }
+      public string Complexity { get; set; }
+      public List<string> Warnings { get; set; }
+      public List<double> MemberAngles { get; set; } // NEW: Sequential angles between members
+      
+      public JointAssessment()
+      {
+          ConnectedElements = new List<int>();
+          Warnings = new List<string>();
+          MemberAngles = new List<double>();
+      }
+  }
+
+  // =================== JOINT ASSESSMENT METHODS ===================
+
+  // FIXED: Calculate angles between consecutive adjacent members only (no wrap-around)
+  private Tuple<List<Tuple<int, int>>, List<double>> CalculateMemberPairAngles(Model model, int nodeIndex, List<int> connectedElements)
+  {
+      var memberPairs = new List<Tuple<int, int>>();
+      var angles = new List<double>();
+      
+      if (connectedElements.Count < 2) 
+          return new Tuple<List<Tuple<int, int>>, List<double>>(memberPairs, angles);
+
+      // Convert node position
+      Karamba.Geometry.Point3 k_nodePos = model.nodes[nodeIndex].pos;
+      Rhino.Geometry.Point3d nodePos = new Rhino.Geometry.Point3d(k_nodePos.X, k_nodePos.Y, k_nodePos.Z);
+
+      Print($"    Debug Node {nodeIndex}: Position = ({nodePos.X:F2}, {nodePos.Y:F2}, {nodePos.Z:F2})");
+
+      // Calculate direction vectors for each element with their indices
+      var elementDirections = new Dictionary<int, Rhino.Geometry.Vector3d>();
+      
+      foreach (int elemIdx in connectedElements)
+      {
+          var elem = model.elems[elemIdx];
+          if (elem is ModelElementStraightLine)
+          {
+              // Get element direction vector pointing away from the joint
+              Karamba.Geometry.Point3 k_startNodePos = model.nodes[elem.node_inds[0]].pos;
+              Rhino.Geometry.Point3d startNodePos = new Rhino.Geometry.Point3d(k_startNodePos.X, k_startNodePos.Y, k_startNodePos.Z);
+
+              Karamba.Geometry.Point3 k_endNodePos = model.nodes[elem.node_inds[1]].pos;
+              Rhino.Geometry.Point3d endNodePos = new Rhino.Geometry.Point3d(k_endNodePos.X, k_endNodePos.Y, k_endNodePos.Z);
+
+              Rhino.Geometry.Vector3d dir;
+              string directionInfo;
+
+              if (elem.node_inds[0] == nodeIndex)
+              {
+                  dir = endNodePos - nodePos;
+                  directionInfo = $"from Node{nodeIndex} to Node{elem.node_inds[1]}";
+              }
+              else if (elem.node_inds[1] == nodeIndex)
+              {
+                  dir = startNodePos - nodePos;
+                  directionInfo = $"from Node{nodeIndex} to Node{elem.node_inds[0]}";
+              }
+              else
+              {
+                  continue; // Skip elements not properly connected
+              }
+
+              if (dir.SquareLength > 1e-12)
+              {
+                  dir.Unitize();
+                  elementDirections[elemIdx] = dir;
+                  Print($"    Debug Elem{elemIdx}: Direction = ({dir.X:F3}, {dir.Y:F3}, {dir.Z:F3}) {directionInfo}");
+              }
+              else
+              {
+                  Print($"    Warning: Elem{elemIdx} has zero length direction vector!");
+              }
+          }
+      }
+
+      // For 2 elements, just calculate the angle between them
+      if (connectedElements.Count == 2)
+      {
+          var elemList = elementDirections.Keys.ToList();
+          elemList.Sort(); // Sort by element index for consistency
+          
+          if (elemList.Count == 2)
+          {
+              int elem1 = elemList[0];
+              int elem2 = elemList[1];
+              var dir1 = elementDirections[elem1];
+              var dir2 = elementDirections[elem2];
+              
+              // Calculate the actual angle between the vectors (0-180°)
+              double dot = dir1 * dir2;
+              dot = Math.Max(-1.0, Math.Min(1.0, dot)); // Clamp for numerical safety
+              
+              double angleRad = Math.Acos(dot); // True angle
+              double angleDeg = angleRad * 180.0 / Math.PI;
+              
+              Print($"    Debug: Elem{elem1} to Elem{elem2}: dot={dot:F4}, angle={angleDeg:F2}°");
+              
+              memberPairs.Add(new Tuple<int, int>(elem1, elem2));
+              angles.Add(angleDeg);
+          }
+      }
+      else if (connectedElements.Count > 2)
+      {
+          // SIMPLE APPROACH: Find the actual sequence of minimum angles between elements
+          var elemList = elementDirections.Keys.ToList();
+          Print($"    Debug: Initial element list: {string.Join(", ", elemList)}");
+          
+          // Print all pairwise angles first to understand the spatial arrangement
+          Print($"    Debug: All pairwise angles:");
+          for (int i = 0; i < elemList.Count; i++)
+          {
+              for (int j = i + 1; j < elemList.Count; j++)
+              {
+                  var dir1 = elementDirections[elemList[i]];
+                  var dir2 = elementDirections[elemList[j]];
+                  double dot = dir1 * dir2;
+                  dot = Math.Max(-1.0, Math.Min(1.0, dot));
+                  double angleDeg = Math.Acos(dot) * 180.0 / Math.PI;
+                  Print($"      Elem{elemList[i]} to Elem{elemList[j]}: {angleDeg:F1}°");
+              }
+          }
+          
+          // Build sequence by finding smallest angles between adjacent elements
+          var sequenceElements = new List<int>();
+          var remainingElements = new List<int>(elemList);
+          
+          // Start with the first element
+          sequenceElements.Add(remainingElements[0]);
+          remainingElements.RemoveAt(0);
+          
+          // Build sequence by always adding the element that makes the smallest angle with the last added
+          while (remainingElements.Count > 0)
+          {
+              int lastElem = sequenceElements[sequenceElements.Count - 1];
+              var lastDir = elementDirections[lastElem];
+              
+              double minAngle = double.MaxValue;
+              int bestNextElem = -1;
+              
+              foreach (int candidateElem in remainingElements)
+              {
+                  var candidateDir = elementDirections[candidateElem];
+                  double dot = lastDir * candidateDir;
+                  dot = Math.Max(-1.0, Math.Min(1.0, dot));
+                  double angle = Math.Acos(dot) * 180.0 / Math.PI;
+                  
+                  if (angle < minAngle)
+                  {
+                      minAngle = angle;
+                      bestNextElem = candidateElem;
+                  }
+              }
+              
+              if (bestNextElem != -1)
+              {
+                  sequenceElements.Add(bestNextElem);
+                  remainingElements.Remove(bestNextElem);
+                  Print($"    Debug: Added Elem{bestNextElem} to sequence (angle {minAngle:F1}° from Elem{lastElem})");
+              }
+              else
+              {
+                  break; // Shouldn't happen
+              }
+          }
+
+          Print($"    Debug: Final sequence: {string.Join(", ", sequenceElements)}");
+
+          // Calculate angles between consecutive elements in the sequence
+          for (int i = 0; i < sequenceElements.Count - 1; i++)
+          {
+              int elem1 = sequenceElements[i];
+              int elem2 = sequenceElements[i + 1];
+              
+              var dir1 = elementDirections[elem1];
+              var dir2 = elementDirections[elem2];
+              
+              double dot = dir1 * dir2;
+              dot = Math.Max(-1.0, Math.Min(1.0, dot));
+              
+              double angleRad = Math.Acos(dot);
+              double angleDeg = angleRad * 180.0 / Math.PI;
+              
+              Print($"    Debug: Sequential Elem{elem1} to Elem{elem2}: dot={dot:F4}, angle={angleDeg:F2}°");
+              
+              memberPairs.Add(new Tuple<int, int>(elem1, elem2));
+              angles.Add(angleDeg);
+          }
+      }
+
+      return new Tuple<List<Tuple<int, int>>, List<double>>(memberPairs, angles);
+  }
+
+  // Generate specific joint recommendations
+  private void GenerateJointRecommendations(JointAssessment assessment)
+  {
+      const double ANGLE_CRIT_ACUTE = 30.0; // degrees
+      
+      if (assessment.MinAngle < ANGLE_CRIT_ACUTE)
+      {
+          assessment.Warnings.Add($"Acute angle ({assessment.MinAngle:F0}°) - high splitting risk!");
+      }
+      
+      // RED Category
+      if (assessment.Category == "RED")
+      {
+
+        assessment.Recommendation = "Complex Multi-Member Joint. Consider: Custom steel gusset plate with bolted connections, or engineered steel node connector.";
+        assessment.Complexity = "High to Very High";
+        if (assessment.MinAngle < ANGLE_CRIT_ACUTE)
+        {
+            assessment.Warnings.Add("Combination of many members and acute angles is extremely challenging!");
+        }
+
+      }
+      // YELLOW Category
+      else if (assessment.Category == "YELLOW")
+      {
+
+        if (assessment.MaxAxial < 0)
+        {
+            assessment.Recommendation = "Axial Tension Node. Consider: Toothed-plate connectors, bolted connection with steel side plates, or multiple self-tapping screws for lower loads.";
+        }
+        else
+        {
+            assessment.Recommendation = "Axial Compression Node. Consider: Direct bearing (if angles allow), bolted/doweled connection with shear plates or split rings.";
+        }
+        assessment.Complexity = "Medium";
+
+      }
+      // GREEN Category
+      else
+      {
+
+        assessment.Recommendation = "Light-duty Connection. Consider: Wood screws, nails, or simple single-bolt connection";
+        assessment.Complexity = "Low";
+          
+      }
+  }
+
+    // Joint Assessment method that groups collinear elements
+    private JointAssessment AssessJoint(Model model, int nodeIndex, Dictionary<int, Tuple<double, double, double>> elementForces)
+    {
+        var assessment = new JointAssessment { NodeIndex = nodeIndex };
+
+        // Find all elements connected to this node
+        for (int e = 0; e < model.elems.Count; e++)
+        {
+            var elem = model.elems[e];
+            if (elem.node_inds.Contains(nodeIndex))
+            {
+                assessment.ConnectedElements.Add(e);
+            }
+        }
+
+        // Calculate forces at joint
+        double maxMoment = 0.0;
+        double maxAxial = 0.0;
+        double maxShear = 0.0;
+
+        foreach (int elemIdx in assessment.ConnectedElements)
+        {
+            if (elementForces.ContainsKey(elemIdx))
+            {
+                maxMoment = Math.Max(maxMoment, Math.Abs(elementForces[elemIdx].Item2));
+                maxAxial = Math.Max(maxAxial, elementForces[elemIdx].Item1);
+                maxShear = Math.Max(maxShear, Math.Abs(elementForces[elemIdx].Item3));
+            }
+        }
+
+        assessment.MaxMoment = maxMoment;
+        assessment.MaxAxial = maxAxial;
+        assessment.MaxShear = maxShear;
+
+        // NEW: Calculate member pair angles with proper identification FOR OUTPUT ONLY
+        var memberPairData = CalculateMemberPairAngles(model, nodeIndex, assessment.ConnectedElements);
+        var memberPairs = memberPairData.Item1;
+        var pairAngles = memberPairData.Item2;
+        
+        // NOTE: assessment.MemberAngles is NOT used for joint categorization
+        // Joint categorization uses the grouped collinear logic in AssessJoint method
+        assessment.MemberAngles = pairAngles;
+
+        // NEW: Group collinear elements and get effective member count
+        var memberGroups = GroupCollinearElements(model, nodeIndex, assessment.ConnectedElements);
+        int effectiveMemberCount = memberGroups.Count;
+
+        // Calculate minimum angle between member groups (not individual elements)
+        assessment.MinAngle = CalculateMinimumAngleBetweenGroups(model, nodeIndex, memberGroups);
+
+        // Apply R/Y/G logic using EFFECTIVE member count
+        const double ACUTE_ANGLE_THRESHOLD_YELLOW = 45.0; // degrees
+        const double CRITICAL_ACUTE_ANGLE = 25;         // degrees
+
+        // --- RED CONDITIONS ---
+        // Member count over or equals to 4, or minimum angle under critical acute threshold
+        if (effectiveMemberCount >= 4 || assessment.MinAngle < CRITICAL_ACUTE_ANGLE)
+        {
+            assessment.Category = "RED";
+        }
+        // --- MODIFIED YELLOW CONDITIONS ---
+        // Minimum angle under acute threshold or member count over or equals to 3
+        else if (assessment.MinAngle < ACUTE_ANGLE_THRESHOLD_YELLOW || effectiveMemberCount >= 3)
+        {
+            assessment.Category = "YELLOW";
+        }
+        // --- GREEN CONDITION ---
+        else // If none of the above RED or YELLOW conditions are met
+        {
+            assessment.Category = "GREEN";
+        }
+
+        // Generate specific recommendations
+        GenerateJointRecommendations(assessment);
+
+        return assessment;
+    }
+
+    // Group collinear elements into member groups
+    private List<List<int>> GroupCollinearElements(Model model, int nodeIndex, List<int> connectedElements)
+    {
+        const double COLLINEAR_TOLERANCE = 5.0; // degrees - elements within this angle are considered collinear
+
+        if (connectedElements.Count < 2) 
+            return new List<List<int>> { connectedElements };
+
+        // Convert node position
+        Karamba.Geometry.Point3 k_nodePos = model.nodes[nodeIndex].pos;
+        Rhino.Geometry.Point3d nodePos = new Rhino.Geometry.Point3d(k_nodePos.X, k_nodePos.Y, k_nodePos.Z);
+
+        // Calculate direction vectors for each element
+        var elementDirections = new Dictionary<int, Rhino.Geometry.Vector3d>();
+        
+        foreach (int elemIdx in connectedElements)
+        {
+            var elem = model.elems[elemIdx];
+            if (elem is ModelElementStraightLine)
+            {
+                // Get element direction vector pointing away from the joint
+                Karamba.Geometry.Point3 k_startNodePos = model.nodes[elem.node_inds[0]].pos;
+                Rhino.Geometry.Point3d startNodePos = new Rhino.Geometry.Point3d(k_startNodePos.X, k_startNodePos.Y, k_startNodePos.Z);
+
+                Karamba.Geometry.Point3 k_endNodePos = model.nodes[elem.node_inds[1]].pos;
+                Rhino.Geometry.Point3d endNodePos = new Rhino.Geometry.Point3d(k_endNodePos.X, k_endNodePos.Y, k_endNodePos.Z);
+
+                Rhino.Geometry.Vector3d dir;
+
+                if (elem.node_inds[0] == nodeIndex)
+                {
+                    dir = endNodePos - nodePos;
+                }
+                else if (elem.node_inds[1] == nodeIndex)
+                {
+                    dir = startNodePos - nodePos;
+                }
+                else
+                {
+                    continue; // Skip elements not properly connected
+                }
+
+                if (dir.SquareLength > 1e-12)
+                {
+                    dir.Unitize();
+                    elementDirections[elemIdx] = dir;
+                }
+            }
+        }
+
+        // Group elements by direction similarity
+        var memberGroups = new List<List<int>>();
+        var processedElements = new HashSet<int>();
+
+        foreach (var kvp in elementDirections)
+        {
+            int elemIdx = kvp.Key;
+            var direction = kvp.Value;
+
+            if (processedElements.Contains(elemIdx))
+                continue;
+
+            // Start a new group with this element
+            var currentGroup = new List<int> { elemIdx };
+            processedElements.Add(elemIdx);
+
+            // Find all other elements that are collinear with this one
+            foreach (var otherKvp in elementDirections)
+            {
+                int otherElemIdx = otherKvp.Key;
+                var otherDirection = otherKvp.Value;
+
+                if (processedElements.Contains(otherElemIdx))
+                    continue;
+
+                // Calculate angle between directions
+                double dot = direction * otherDirection;
+                double clampedDot = Math.Max(-1.0, Math.Min(1.0, dot));
+                double angleRad = Math.Acos(Math.Abs(clampedDot)); // Use absolute value to handle opposite directions
+                double angleDeg = angleRad * 180.0 / Math.PI;
+
+                // If elements are nearly collinear (including opposite directions), group them
+                if (angleDeg <= COLLINEAR_TOLERANCE || angleDeg >= (180.0 - COLLINEAR_TOLERANCE))
+                {
+                    currentGroup.Add(otherElemIdx);
+                    processedElements.Add(otherElemIdx);
+                }
+            }
+
+            memberGroups.Add(currentGroup);
+        }
+
+        // Add any elements that weren't processed (shouldn't happen with proper straight line elements)
+        foreach (int elemIdx in connectedElements)
+        {
+            if (!processedElements.Contains(elemIdx))
+            {
+                memberGroups.Add(new List<int> { elemIdx });
+            }
+        }
+
+        return memberGroups;
+    }
+
+    // Calculate minimum angle between member groups (not individual elements)
+    private double CalculateMinimumAngleBetweenGroups(Model model, int nodeIndex, List<List<int>> memberGroups)
+    {
+        if (memberGroups.Count < 2) return 180.0;
+
+        // Convert node position
+        Karamba.Geometry.Point3 k_nodePos = model.nodes[nodeIndex].pos;
+        Rhino.Geometry.Point3d nodePos = new Rhino.Geometry.Point3d(k_nodePos.X, k_nodePos.Y, k_nodePos.Z);
+
+        // Calculate representative direction for each member group
+        var groupDirections = new List<Rhino.Geometry.Vector3d>();
+
+        foreach (var group in memberGroups)
+        {
+            if (group.Count == 0) continue;
+
+            // Use the first element in the group as representative direction
+            int representativeElemIdx = group[0];
+            var elem = model.elems[representativeElemIdx];
+            
+            if (elem is ModelElementStraightLine)
+            {
+                Karamba.Geometry.Point3 k_startNodePos = model.nodes[elem.node_inds[0]].pos;
+                Rhino.Geometry.Point3d startNodePos = new Rhino.Geometry.Point3d(k_startNodePos.X, k_startNodePos.Y, k_startNodePos.Z);
+
+                Karamba.Geometry.Point3 k_endNodePos = model.nodes[elem.node_inds[1]].pos;
+                Rhino.Geometry.Point3d endNodePos = new Rhino.Geometry.Point3d(k_endNodePos.X, k_endNodePos.Y, k_endNodePos.Z);
+
+                Rhino.Geometry.Vector3d dir;
+
+                if (elem.node_inds[0] == nodeIndex)
+                {
+                    dir = endNodePos - nodePos;
+                }
+                else if (elem.node_inds[1] == nodeIndex)
+                {
+                    dir = startNodePos - nodePos;
+                }
+                else
+                {
+                    continue;
+                }
+
+                if (dir.SquareLength > 1e-12)
+                {
+                    dir.Unitize();
+                    groupDirections.Add(dir);
+                }
+            }
+        }
+
+        if (groupDirections.Count < 2) return 180.0;
+
+        // Find minimum angle between any two group directions
+        double minAngle = 180.0;
+        for (int i = 0; i < groupDirections.Count - 1; i++)
+        {
+            for (int j = i + 1; j < groupDirections.Count; j++)
+            {
+                double dot = groupDirections[i] * groupDirections[j];
+                double clampedDot = Math.Max(-1.0, Math.Min(1.0, dot));
+                double angleRad = Math.Acos(clampedDot);
+                double angleDeg = angleRad * 180.0 / Math.PI;
+
+                // Take the acute angle
+                double acuteAngle = Math.Min(angleDeg, 180.0 - angleDeg);
+                minAngle = Math.Min(minAngle, acuteAngle);
+            }
+        }
+
+        return minAngle;
+    }
+
+  // =================== OPTIMIZATION METHODS ===================
+  
+  // Calculate all element forces at once
+  private Dictionary<int, Tuple<double, double, double>> CalculateAllElementForces(Model workModel, string lcName, List<int> elementIndices)
+  {
+      var result = new Dictionary<int, Tuple<double, double, double>>();
+      
+      var elemIndicesStr = elementIndices.Select(idx => idx.ToString()).ToList();
+      
+      List<List<double>> N, V, M;
+      BeamResultantForces.solve(workModel, elemIndicesStr, lcName, 10, 5, out N, out V, out M);
+      
+      for (int i = 0; i < elementIndices.Count; i++)
+      {
+          double axial = N[0][i];
+          double moment = Math.Abs(M[0][i]);
+          double shear = Math.Abs(V[0][i]);
+          result[elementIndices[i]] = new Tuple<double, double, double>(axial, moment, shear);
+      }
+      
+      return result;
+  }
+  
+  // Calculate interaction ratio
+  private double CalculateInteractionRatio(double axial, double moment, int sectionIndex)
+  {
+      double A = sectionAreas[sectionIndex];
+      double Wel_y = sectionWelY[sectionIndex];
+
+      double designFm = designFmValues[sectionIndex];
+      double designFc = designFcValues[sectionIndex];
+      double designFt = designFtValues[sectionIndex];
+      double designT = designTValues[sectionIndex];
+      
+      double utilAxial;
+      if (axial >= 0)  // Tension
+      {
+          utilAxial = ((axial * 1000) / A) / designFt;
+      }
+      else  // Compression
+      {
+          utilAxial = ((Math.Abs(axial) * 1000) / A) / designFc;
+      }
+      
+      double utilBending = ((moment * 1000000) / Wel_y) / designFm;
+
+      double combinedAxialBendingUtil = utilAxial + utilBending;
+
+      return combinedAxialBendingUtil;
+  }
+
+  private bool CheckShear(double shear, int sectionIndex){
+    double designT = designTValues[sectionIndex];
+    return shear <= designT;
+
+  }
+  
+  // Find appropriate cross-section
+private int FindAppropriateSection(
+    double axial,
+    double moment,
+    double shear,
+    List<CroSec_Beam> croSecsAll,
+    int currentSectionIndex,
+    double targetUtil = 1.0,
+    double downsizeIfCurrentUtilIsBelow = 0.90, // Consider downsizing if current is <90%
+    double acceptSmallerIfItsUtilIsBelow = 0.95) // Accept a smaller section only if ITS util is <95%
+{
+    double utilWithCurrent = CalculateInteractionRatio(axial, moment, currentSectionIndex);
+    bool currentShear = CheckShear(shear, currentSectionIndex);
+
+    if (utilWithCurrent <= targetUtil && currentShear)
+    {
+        // Current section is adequate.
+        if (utilWithCurrent < downsizeIfCurrentUtilIsBelow && currentSectionIndex > 0)
+        {
+            // Current is underutilized, let's see if a smaller one works WELL.
+            // Iterate from smallest up to just before current.
+            // We want the *largest of the smaller sections* that meets the acceptSmallerIfItsUtilIsBelow criterion.
+            int bestSmallerCandidateIdx = -1;
+            for (int i = 0; i < currentSectionIndex; i++)
+            {
+                double utilWithSmaller = CalculateInteractionRatio(axial, moment, i);
+                if (utilWithSmaller <= targetUtil && utilWithSmaller <= acceptSmallerIfItsUtilIsBelow)
+                {
+                    bestSmallerCandidateIdx = i; // This smaller one is good, store it. May find a larger one (closer to current) later.
+                }
+                else if (utilWithSmaller <= targetUtil && bestSmallerCandidateIdx != -1)
+                {
+                    // This smaller one works, but is > acceptSmallerIfItsUtilIsBelow.
+                    // If we already found one that was even better utilized (lower util), stick with that.
+                    // This logic isn't quite right for "largest of the smaller".
+                    // Let's rephrase: find the SMALLEST section overall that gives util <= acceptSmallerIfItsUtilIsBelow
+                }
+            }
+
+            // Simpler downsizing: find the first (smallest) section that gives a comfortable utilization
+            for (int i = 0; i < currentSectionIndex; i++) {
+                double utilWithSmallerCandidate = CalculateInteractionRatio(axial, moment, i);
+                if (utilWithSmallerCandidate <= acceptSmallerIfItsUtilIsBelow) { // Note: using acceptSmallerIfItsUtilIsBelow
+                    return i; // Found a smaller section that is comfortably utilized
+                }
+            }
+            // If no smaller section is comfortably utilized, but one might be just at targetUtil:
+            // This part might still cause flip-flop if not careful.
+            // Fallback: if we considered downsizing but found no *comfortably* smaller section, stick with current.
+        }
+        return currentSectionIndex; // Stick with current
+    }
+    else // utilWithCurrent > targetUtil
+    {
+        // Upsize logic (seems okay)
+        for (int i = currentSectionIndex + 1; i < croSecsAll.Count; i++)
+        {
+            double utilWithLarger = CalculateInteractionRatio(axial, moment, i);
+            if (utilWithLarger <= targetUtil)
+            {
+                return i;
+            }
+        }
+        if (currentSectionIndex == croSecsAll.Count - 1 && utilWithCurrent > targetUtil) return currentSectionIndex; // already largest and failing
+        return croSecsAll.Count - 1; // return largest as last resort
+    }
+}
+  
+  // Pre-calculate properties
+  private void PreCalculateProperties(List<CroSec_Beam> croSecsAll, double kmod)
+  {
+      designFmValues.Clear();
+      designFcValues.Clear();
+      designFtValues.Clear();
+      designTValues.Clear();
+      sectionAreas.Clear();
+      sectionWelY.Clear();
+      
+      for (int i = 0; i < croSecsAll.Count; i++)
+      {
+          double designFm = kmod * (Math.Abs(charFmValues[i]) * 10) / GAMMA_M;
+          double designFc = kmod * (Math.Abs(charFcValues[i]) * 10) / GAMMA_M;
+          double designFt = kmod * (Math.Abs(charFtValues[i]) * 10) / GAMMA_M;
+          double designT = kmod * (Math.Abs(charTValues[i]) * 10) / GAMMA_M;
+          
+          designFmValues.Add(designFm);
+          designFcValues.Add(designFc);
+          designFtValues.Add(designFt);
+          designTValues.Add(designT);
+          
+          double area = (1000000 * croSecsAll[i].A);
+          double welY = (1000000000 * croSecsAll[i].Wely_z_pos);
+          
+          sectionAreas.Add(area);
+          sectionWelY.Add(welY);
+      }
+  }
+  
+// Standard optimization routine
+private void RunStandardOptimization(Model workModel, List<CroSec_Beam> croSecsAll,
+    List<int> beamElements, string lcName, int niter, KarambaCommon.Toolkit k3d,
+    ref List<double> finalUtilization)
+{
+    bool anySectionChangedInIteration = false;
+
+    var currentAssignedSectionIndices = new Dictionary<int, int>();
+
+    // Initialize currentAssignedSectionIndices
+    for (int i = 0; i < workModel.elems.Count; i++)
+    {
+        if (beamElements.Contains(i))
+        {
+            var beam = workModel.elems[i] as ModelBeam;
+            if (beam != null && beam.crosec is CroSec_Beam cs)
+            {
+                int initialIdx = croSecsAll.IndexOf(cs);
+                currentAssignedSectionIndices[i] = (initialIdx != -1) ? initialIdx : 0;
+                if (initialIdx == -1) Print($"Warning: Initial CroSec '{cs.name}' for Elem {i} not in croSecsAll. Tracker defaulted.");
+            }
+            else if (beam != null)
+            {
+                 currentAssignedSectionIndices[i] = 0;
+                 if(beam.crosec == null) Print($"Warning: Elem {i} (ModelBeam) has no initial CroSec. Tracker defaulted.");
+            }
+        }
+    }
+
+    for (int iteration = 0; iteration < niter; iteration++)
+    {
+        string phaseLabel = "Optimization"; // Placeholder, can be passed as argument
+        Print($"--- {phaseLabel} Iteration {iteration + 1} (Max: {niter}) ---");
+
+        IReadOnlyList<double> maxDisp;
+        IReadOnlyList<Vector3> outForce;
+        IReadOnlyList<double> outEnergy;
+        string warning;
+        workModel = k3d.Algorithms.Analyze(
+            workModel, new List<string> { lcName }, out maxDisp, out outForce, out outEnergy, out warning
+        );
+
+        if (!string.IsNullOrEmpty(warning))
+            Print($"  Analysis warning (Iter {iteration + 1}): {warning}");
+
+        anySectionChangedInIteration = false;
+        var elementsToChangeData = new List<Tuple<ModelBeam, CroSec_Beam>>();
+        var allForces = CalculateAllElementForces(workModel, lcName, beamElements);
+
+        // --- LOGGING FOR ALL ELEMENTS ---
+        Print($"  Decision Log (Iter {iteration + 1}):");
+        foreach (int e_idx in beamElements)
+        {
+            var beam = workModel.elems[e_idx] as ModelBeam;
+            if (beam == null) continue;
+
+            int currentSectionIdxForDecision;
+            if (!currentAssignedSectionIndices.TryGetValue(e_idx, out currentSectionIdxForDecision))
+            {
+                Print($"    Error: Elem {e_idx} missing from tracker. Defaulting for safety.");
+                currentSectionIdxForDecision = 0; // Should not happen
+            }
+
+            var forces = allForces[e_idx];
+            double axial = forces.Item1;
+            double moment = forces.Item2;
+            double shear = forces.Item3;
+
+            int newTargetSectionIdx = FindAppropriateSection(
+                axial,
+                moment,
+                shear,
+                croSecsAll,
+                currentSectionIdxForDecision,
+                1.0,    // targetUtil
+                0.90,   // downsizeIfCurrentUtilIsBelow
+                0.95    // acceptSmallerIfItsUtilIsBelow
+            );
+
+            double interactionWithNewTargetSection = CalculateInteractionRatio(axial, moment, newTargetSectionIdx);
+            if (e_idx < finalUtilization.Count)
+            {
+                finalUtilization[e_idx] = interactionWithNewTargetSection;
+            }
+
+            string oldCSName = (currentSectionIdxForDecision >= 0 && currentSectionIdxForDecision < croSecsAll.Count) ? croSecsAll[currentSectionIdxForDecision].name : $"InvalidOldIdx({currentSectionIdxForDecision})";
+            string newCSName = (newTargetSectionIdx >= 0 && newTargetSectionIdx < croSecsAll.Count) ? croSecsAll[newTargetSectionIdx].name : $"InvalidNewIdx({newTargetSectionIdx})";
+
+            Print($"    Elem {e_idx,-3}: CurrCS='{oldCSName,-35}'(idx {currentSectionIdxForDecision,-2}), N={axial,7:F2}, M={moment,6:F2}. TargetCS='{newCSName,-35}'(idx {newTargetSectionIdx,-2}) with Util={interactionWithNewTargetSection:F3}.");
+
+            if (currentSectionIdxForDecision != newTargetSectionIdx)
+            {
+                elementsToChangeData.Add(new Tuple<ModelBeam, CroSec_Beam>(beam, croSecsAll[newTargetSectionIdx]));
+                anySectionChangedInIteration = true;
+            }
+        }
+        // --- END LOGGING FOR ALL ELEMENTS ---
+
+
+        if (anySectionChangedInIteration)
+        {
+            Print($"  Action Log (Iter {iteration + 1}): Changing {elementsToChangeData.Count} element(s):");
+            foreach (var change in elementsToChangeData)
+            {
+                ModelBeam beamToChange = change.Item1;
+                CroSec_Beam newCroSec = change.Item2;
+                
+                string oldCSNameForLog = "Unknown";
+                // Get the name of the section before it's changed, using the tracker
+                if (currentAssignedSectionIndices.TryGetValue(beamToChange.ind, out int oldIdxLogVal) && oldIdxLogVal >=0 && oldIdxLogVal < croSecsAll.Count)
+                {
+                    oldCSNameForLog = croSecsAll[oldIdxLogVal].name;
+                }
+
+                Print($"    - Elem {beamToChange.ind,-3}: '{oldCSNameForLog,-35}' -> '{newCroSec.name,-35}'");
+
+                beamToChange.crosec = newCroSec;
+                // Update tracker with the NEWLY ASSIGNED section index for the NEXT iteration's decisions
+                currentAssignedSectionIndices[beamToChange.ind] = croSecsAll.IndexOf(newCroSec);
+            }
+
+            workModel.initMaterialCroSecLists();
+            workModel.buildFEModel();
+        }
+        else
+        {
+            Print($"  Converged after {iteration + 1} iterations (no sections changed).");
+            break;
+        }
+
+        if (iteration == niter - 1 && anySectionChangedInIteration)
+        {
+            Print($"  Reached max iterations ({niter}) without full convergence (sections still changed).");
+        }
+    }
+}
+
+  // =================== MAIN EXECUTION ===================
+  
+  private void RunScript(
+		object Model_in,
+		List<object> CroSecs_in,
+		DataTree<double> materialProps_in,
+		int niterPhase1,
+		int niterPhase2,
+		string lcName,
+		double kmod,
+		bool enablePhased,
+		bool useAutoThresholds,
+		ref object Model_out,
+		ref object Disp_out,
+		ref object force_out,
+		ref object utilization_out,
+		ref object jointAssessment_out,
+		ref object jointCategories,
+		ref object jointMemberIndex,
+		ref object jointMemberIndices,
+		ref object jointMemberAngles,
+		ref object jointMemberPairs)
+  {
+      // 1) VALIDATE INPUTS
+      var modelInitial = Model_in as Model;
+      if (modelInitial == null)
+          throw new ArgumentException("Input 'Model_in' is not a Karamba Model!");
+
+      if (string.IsNullOrEmpty(lcName))
+          throw new ArgumentException("Load case name cannot be empty!");
+
+      var croSecsAll = new List<CroSec_Beam>();
+      foreach(var obj in CroSecs_in)
+      {
+          if (obj is CroSec_Beam cs)
+              croSecsAll.Add(cs);
+          else
+              throw new ArgumentException("One or more inputs in 'CroSecs_in' are not CroSec_Beam objects!");
+      }
+      
+      if (croSecsAll.Count == 0)
+          throw new ArgumentException("No cross sections provided!");
+          
+      // Process material properties
+      if (materialProps_in == null || materialProps_in.BranchCount < 3)
+          throw new ArgumentException("Material properties input must contain three branches: charFm, charFc, and charFt!");
+          
+      charFmValues = materialProps_in.Branch(0);
+      charFcValues = materialProps_in.Branch(1);
+      charFtValues = materialProps_in.Branch(2);
+      charTValues = materialProps_in.Branch(3);
+      
+      if (charFmValues.Count != croSecsAll.Count || charFcValues.Count != croSecsAll.Count || charFtValues.Count != croSecsAll.Count || charTValues.Count != croSecsAll.Count)
+          throw new ArgumentException("Number of material property values must match number of cross sections!");
+          
+      // 2) PREPARE ANALYSIS
+      var k3d = new KarambaCommon.Toolkit();
+      var workModel = modelInitial.Clone();
+      workModel.cloneElements();
+      
+      PreCalculateProperties(croSecsAll, kmod);
+      
+      var beamElements = new List<int>();
+      for (int e = 0; e < workModel.elems.Count; e++)
+      {
+          if (workModel.elems[e] is ModelBeam)
+              beamElements.Add(e);
+      }
+      
+      DateTime startTime = DateTime.Now;
+      var jointAssessments = new List<JointAssessment>();
+      var finalUtilization = new List<double>(new double[workModel.elems.Count]);
+      
+      // NEW: Initialize data trees for new outputs
+      var jointMemberIndicesTree = new DataTree<int>();
+      var jointMemberAnglesTree = new DataTree<double>();
+      var jointMemberPairsTree = new DataTree<string>(); // NEW: For member pair identification
+      
+      if (!enablePhased)
+      {
+          // Original optimization without phased approach
+          Print("Running standard optimization without phased joint assessment...");
+          RunStandardOptimization(workModel, croSecsAll, beamElements, lcName, niterPhase1, k3d, ref finalUtilization);
+      }
+      else
+      {
+          // PHASE 1A: Initial optimization with pinned joints
+          Print("PHASE 1A: Initial optimization with all joints pinned...");
+          RunStandardOptimization(workModel, croSecsAll, beamElements, lcName, niterPhase1, k3d, ref finalUtilization);
+          
+          // Get forces from Phase 1A
+          var allForces = CalculateAllElementForces(workModel, lcName, beamElements);
+          
+          // PHASE 1B: Joint assessment
+          Print("\nPHASE 1B: Assessing joint stiffness requirements...");
+          
+          // Assess each node
+          var uniqueNodes = new HashSet<int>();
+          foreach (var elem in workModel.elems)
+          {
+              foreach (int nodeIdx in elem.node_inds)
+                  uniqueNodes.Add(nodeIdx);
+          }
+          
+          foreach (int nodeIdx in uniqueNodes)
+          {
+              var assessment = AssessJoint(workModel, nodeIdx, allForces);
+              jointAssessments.Add(assessment);
+              
+              // NEW: Get member pair data for proper correlation
+              var memberPairData = CalculateMemberPairAngles(workModel, nodeIdx, assessment.ConnectedElements);
+              var memberPairs = memberPairData.Item1;
+              var pairAngles = memberPairData.Item2;
+              
+              // NEW: Populate data trees with correlated information
+              var path = new GH_Path(nodeIdx);
+              
+              // Add connected element indices to the tree (sorted order)
+              var sortedElements = assessment.ConnectedElements.OrderBy(e => e).ToList();
+              foreach (int elemIdx in sortedElements)
+              {
+                  jointMemberIndicesTree.Add(elemIdx, path);
+              }
+              
+              // Add member pair angles with corresponding pair information
+              for (int i = 0; i < memberPairs.Count; i++)
+              {
+                  var pair = memberPairs[i];
+                  double angle = pairAngles[i];
+                  
+                  // Add angle to angles tree
+                  jointMemberAnglesTree.Add(angle, path);
+                  
+                  // Add pair description to help identify which elements the angle refers to
+                  string pairDescription = $"Elem{pair.Item1}-Elem{pair.Item2}";
+                  jointMemberPairsTree.Add(pairDescription, path);
+              }
+              
+              Print($"Node {nodeIdx}: {assessment.Category} (Max M={assessment.MaxMoment:F1} kNm, {assessment.ConnectedElements.Count} elements)");
+              
+              // NEW: Print angle information for debugging
+              if (memberPairs.Count > 0)
+              {
+                  Print($"  Angles: {string.Join(", ", memberPairs.Zip(pairAngles, (pair, angle) => $"{angle:F1}° between Elem{pair.Item1}-Elem{pair.Item2}"))}");
+              }
+          }
+          
+          // Summary of joint assessments
+          int redCount = jointAssessments.Count(j => j.Category == "RED");
+          int yellowCount = jointAssessments.Count(j => j.Category == "YELLOW");
+          int greenCount = jointAssessments.Count(j => j.Category == "GREEN");
+          Print($"\nJoint Assessment Summary: {redCount} RED, {yellowCount} YELLOW, {greenCount} GREEN");
+      }
+      
+      // Final analysis
+      IReadOnlyList<double> maxDisp;
+      IReadOnlyList<Vector3> outForce;
+      IReadOnlyList<double> outEnergy;
+      string warning;
+      
+      workModel = k3d.Algorithms.Analyze(
+          workModel, new List<string> { lcName },
+          out maxDisp, out outForce, out outEnergy, out warning
+      );
+      
+      if (!string.IsNullOrEmpty(warning))
+          Print("Analysis warning: " + warning);
+      
+      // Calculate final utilization
+      var finalForces = CalculateAllElementForces(workModel, lcName, beamElements);
+      foreach (int e in beamElements)
+      {
+          var beam = workModel.elems[e] as ModelBeam;
+          if (beam == null) continue;
+          
+          var currentCroSec = beam.crosec as CroSec_Beam;
+          if (currentCroSec == null) continue;
+          
+          // Find section index
+          int sectionIndex = 0;
+          for (int i = 0; i < croSecsAll.Count; i++)
+          {
+              if (croSecsAll[i].name == currentCroSec.name)
+              {
+                  sectionIndex = i;
+                  break;
+              }
+          }
+          
+          var forces = finalForces[e];
+          double interaction = CalculateInteractionRatio(forces.Item1, forces.Item2, sectionIndex);
+          finalUtilization[e] = interaction;
+      }
+      
+      // Performance info
+      TimeSpan processingTime = DateTime.Now - startTime;
+      Print($"\nTotal processing time: {processingTime.TotalSeconds:F2} seconds");
+      
+      // 6) OUTPUTS
+      Model_out = new Karamba.GHopper.Models.GH_Model(workModel);
+      Disp_out = maxDisp.Count > 0 ? maxDisp[0] : 0.0;
+      
+      if (enablePhased)
+      {
+          force_out = $"Phased optimization completed: Phase 1A ({niterPhase1} iter), Phase 2 ({niterPhase2} iter)";
+          
+          // Create detailed joint assessment output
+          var jointInfo = new List<string>();
+          var jointCategory = new List<string>();
+          foreach (var assessment in jointAssessments.OrderBy(j => j.NodeIndex))
+          {
+              jointInfo.Add($"NODE {assessment.NodeIndex}:");
+              jointInfo.Add($"  Category: {assessment.Category}");
+              jointCategory.Add(assessment.Category);
+              jointInfo.Add($"  Forces: M={assessment.MaxMoment:F1}kNm, N={assessment.MaxAxial:F1}kN, V={assessment.MaxShear:F1}kN");
+              jointInfo.Add($"  Min Angle: {assessment.MinAngle:F1}°");
+              jointInfo.Add($"  {assessment.Recommendation}");
+              jointInfo.Add($"  Complexity: {assessment.Complexity}");
+              if (assessment.Warnings.Count > 0)
+              {
+                  jointInfo.Add($"  WARNINGS: {string.Join("; ", assessment.Warnings)}");
+              }
+          }
+          jointAssessment_out = jointInfo;
+          jointCategories = jointCategory;
+          
+          // NEW: Set the new outputs with proper correlation
+          jointMemberIndices = jointMemberIndicesTree;
+          jointMemberAngles = jointMemberAnglesTree;
+          jointMemberPairs = jointMemberPairsTree;
+      }
+      else
+      {
+          force_out = $"Standard optimization completed after {niterPhase1} iterations";
+          jointAssessment_out = new List<string> { "Phased optimization not enabled" };
+          
+          // NEW: Provide empty data trees when phased optimization is not enabled
+          jointMemberIndices = new DataTree<int>();
+          jointMemberAngles = new DataTree<double>();
+          jointMemberPairs = new DataTree<string>();
+      }
+      
+      utilization_out = finalUtilization;
+  }
+}

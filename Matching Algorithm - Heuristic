@@ -1,0 +1,307 @@
+#region Usings
+using System;
+using System.Linq;
+using System.Collections;
+using System.Collections.Generic;
+using System.Drawing;
+
+using Rhino;
+using Rhino.Geometry;
+
+using Grasshopper;
+using Grasshopper.Kernel;
+using Grasshopper.Kernel.Data;
+using Grasshopper.Kernel.Types;
+#endregion
+
+public class Script_Instance : GH_ScriptInstance
+{
+    // =============================================================================================
+    // Helper Configuration
+    // =============================================================================================
+    private const double MAX_STOCK_TO_DEMAND_AREA_RATIO = 10;
+    private const double MINIMUM_SIGNIFICANT_LEFTOVER_LENGTH = 100.0; // Example: Only consider leftovers >= 100mm for re-packing
+
+    // =============================================================================================
+    // Helper Data Structures
+    // =============================================================================================
+    public class DemandElement
+    {
+        public int OriginalID { get; set; }
+        public double Length { get; set; }
+        public double Height { get; set; }
+        public double Width { get; set; }
+        public int StrengthClass { get; set; }
+        public bool IsAssigned { get; set; } = false;
+        public double CrossSectionalArea => Width * Height;
+        public double Volume => Length * CrossSectionalArea;
+    }
+
+    public class ReclaimedStockElement // Represents both original stock and usable leftovers
+    {
+        public int OriginalID { get; set; } // This ID links back to the very original physical piece
+        public double OriginalLength { get; set; } // For original pieces; for leftovers, this is the leftover's starting length
+        public double CurrentLeftoverLength { get; set; }
+        public double Height { get; set; }
+        public double Width { get; set; }
+        public int StrengthClass { get; set; }
+        public List<DemandElement> AssignedDemands { get; private set; } = new List<DemandElement>();
+        public bool IsUsedAtAll { get; set; } = false; // For original pieces
+        public double CrossSectionalArea => Width * Height;
+
+        // Constructor for original stock
+        public ReclaimedStockElement() { }
+
+        // Constructor for creating a "virtual" stock piece from a leftover
+        public ReclaimedStockElement(ReclaimedStockElement parentStock, double leftoverLength)
+        {
+            OriginalID = parentStock.OriginalID; // Link to the parent
+            OriginalLength = leftoverLength;     // This "leftover piece" starts with this length
+            CurrentLeftoverLength = leftoverLength;
+            Height = parentStock.Height;
+            Width = parentStock.Width;
+            StrengthClass = parentStock.StrengthClass;
+            IsUsedAtAll = false; // This new virtual piece is initially unused for the re-packing phase
+            // AssignedDemands list is new and empty for this virtual piece
+        }
+    }
+
+    public class PotentialMatch
+    {
+        public ReclaimedStockElement Stock { get; set; } // Could be an original piece or a "virtual" leftover piece
+        public DemandElement Demand { get; set; }
+        public double Score { get; set; }
+    }
+
+    // =============================================================================================
+    // Main Script Logic
+    // =============================================================================================
+    private void RunScript(
+		DataTree<double> DemandBank,
+		DataTree<double> ReclaimedStockBank,
+		ref object MatchedDemandsOutput,
+		ref object UnmatchedDemandsOutput)
+    {
+        List<DemandElement> demands = LoadDemands(DemandBank);
+        List<ReclaimedStockElement> initialReclaimedStock = LoadReclaimedStock(ReclaimedStockBank);
+
+        if (!demands.Any())
+        {
+            AddRuntimeMessage(GH_RuntimeMessageLevel.Warning, "No demands provided.");
+            MatchedDemandsOutput = CreateOutputForMatched(new List<ReclaimedStockElement>());
+            UnmatchedDemandsOutput = CreateOutputForUnmatched(new List<DemandElement>(), 0);
+            return;
+        }
+
+        // --- Main dictionary to track the state of original reclaimed pieces ---
+        // The AssignedDemands list in these objects will be updated in both passes.
+        Dictionary<int, ReclaimedStockElement> masterStockDict = initialReclaimedStock.ToDictionary(s => s.OriginalID);
+
+        // --- Sort Demands ---
+        List<DemandElement> sortedDemands = demands
+            .OrderByDescending(d => d.Volume)
+            .ThenByDescending(d => d.StrengthClass)
+            .ThenByDescending(d => d.Length)
+            .ToList();
+
+        // --- PASS 1: Assign demands to original reclaimed stock ---
+        Print("--- Starting Pass 1: Assigning to Original Stock ---");
+        AssignDemandsToStockList(sortedDemands.Where(d => !d.IsAssigned).ToList(), initialReclaimedStock, masterStockDict);
+        long pass1AssignedCount = demands.LongCount(d => d.IsAssigned);
+        Print($"--- Pass 1 Complete. Assigned {pass1AssignedCount} demands. ---");
+
+
+        // --- Collect Significant Leftovers from PASS 1 ---
+        List<ReclaimedStockElement> leftoverStockPieces = new List<ReclaimedStockElement>();
+        foreach (ReclaimedStockElement originalStock in masterStockDict.Values)
+        {
+            if (originalStock.IsUsedAtAll && originalStock.CurrentLeftoverLength >= MINIMUM_SIGNIFICANT_LEFTOVER_LENGTH)
+            {
+                // Create a new "virtual" stock piece representing this leftover
+                // It inherits the OriginalID of its parent.
+                leftoverStockPieces.Add(new ReclaimedStockElement(originalStock, originalStock.CurrentLeftoverLength));
+            }
+        }
+        Print($"Collected {leftoverStockPieces.Count} significant leftover pieces for re-packing.");
+
+
+        // --- PASS 2: Re-packing - Assign remaining demands to leftovers ---
+        if (leftoverStockPieces.Any() && demands.Any(d => !d.IsAssigned))
+        {
+            Print("--- Starting Pass 2: Re-packing Leftovers ---");
+            // We need to pass masterStockDict here so that if a demand is assigned to a leftover,
+            // that demand is added to the *original* stock piece's AssignedDemands list for correct output.
+            AssignDemandsToStockList(sortedDemands.Where(d => !d.IsAssigned).ToList(), leftoverStockPieces, masterStockDict, isRepackingPass: true);
+            long pass2AssignedCount = demands.LongCount(d => d.IsAssigned) - pass1AssignedCount;
+            Print($"--- Pass 2 Complete. Assigned an additional {pass2AssignedCount} demands to leftovers. ---");
+        }
+        else if (!demands.Any(d => !d.IsAssigned))
+        {
+             Print("All demands assigned in Pass 1. No re-packing needed.");
+        }
+        else
+        {
+            Print("No significant leftovers or no remaining unassigned demands for re-packing.");
+        }
+
+
+        // --- Prepare Outputs ---
+        // The masterStockDict now contains all original stock pieces,
+        // with their AssignedDemands lists populated from both passes,
+        // and their CurrentLeftoverLength reflecting the final state after both passes.
+        MatchedDemandsOutput = CreateOutputForMatched(masterStockDict.Values.Where(s => s.IsUsedAtAll).ToList());
+        
+        int maxReclaimedIdFromInput = 0;
+        if (initialReclaimedStock.Any())
+        {
+            maxReclaimedIdFromInput = initialReclaimedStock.Max(s => s.OriginalID);
+        }
+        UnmatchedDemandsOutput = CreateOutputForUnmatched(demands.Where(d => !d.IsAssigned).ToList(), maxReclaimedIdFromInput);
+
+        long finalAssignedCount = demands.LongCount(d => d.IsAssigned);
+        Print($"Processing Complete. Total Demands: {demands.Count}. Total Assigned: {finalAssignedCount}. Unassigned: {demands.Count - finalAssignedCount}.");
+    }
+
+    // =============================================================================================
+    // Helper Method: Assign Demands to a given list of Stock (used for both passes)
+    // =============================================================================================
+    private void AssignDemandsToStockList(
+        List<DemandElement> demandsToAssign, 
+        List<ReclaimedStockElement> availableStockPool, 
+        Dictionary<int, ReclaimedStockElement> masterStockUpdateDict,
+        bool isRepackingPass = false)
+    {
+        // If it's a re-packing pass, availableStockPool consists of "virtual" leftover pieces.
+        // We need a way to update their CurrentLeftoverLength locally during this pass,
+        // and also update the master stock piece's record.
+
+        Dictionary<int, ReclaimedStockElement> currentPassStockDict;
+        if (isRepackingPass)
+        {
+            // For repacking, we operate on the list of leftover pieces directly for finding fits.
+            // The OriginalID of these leftover pieces links back to the masterStockUpdateDict.
+            // We need to manage the CurrentLeftoverLength of these virtual pieces.
+            // A simple way is to make a temporary dictionary for this pass.
+            currentPassStockDict = availableStockPool.Select((s, i) => new { s, TempID = i })
+                                                    .ToDictionary(x => x.TempID, x => x.s);
+                                                    // This gives temporary unique IDs if multiple leftovers from same parent were possible (not the case here)
+                                                    // A simpler way if OriginalIDs in availableStockPool are unique for this pass:
+            currentPassStockDict = availableStockPool.ToDictionary(s => s.OriginalID * 1000 + (int)(s.OriginalLength)); // Create a somewhat unique key for leftover pieces
+        }
+        else
+        {
+            // For the first pass, availableStockPool is the initialReclaimedStock, and masterStockUpdateDict is effectively its dictionary form.
+            currentPassStockDict = masterStockUpdateDict;
+        }
+
+
+        foreach (DemandElement demand in demandsToAssign) // demandsToAssign is already filtered for !d.IsAssigned
+        {
+            if (demand.IsAssigned) continue; // Double check
+
+            PotentialMatch bestMatch = null;
+
+            // Attempt 1: Fit into "already used" pieces *within the current availableStockPool*
+            // For pass 1, this means original stock that got a piece.
+            // For pass 2, this means leftover pieces that got a piece during this re-pack pass.
+            List<ReclaimedStockElement> partiallyUsedInThisPool = currentPassStockDict.Values
+                .Where(s => s.IsUsedAtAll && s.CurrentLeftoverLength >= demand.Length)
+                .ToList();
+            if (partiallyUsedInThisPool.Any())
+            {
+                bestMatch = FindBestFit(demand, partiallyUsedInThisPool);
+            }
+
+            // Attempt 2: Fit into "unused" pieces *within the current availableStockPool*
+            if (bestMatch == null)
+            {
+                List<ReclaimedStockElement> unusedInThisPool = currentPassStockDict.Values
+                    .Where(s => !s.IsUsedAtAll && s.CurrentLeftoverLength >= demand.Length)
+                    .ToList();
+                if (unusedInThisPool.Any())
+                {
+                    bestMatch = FindBestFit(demand, unusedInThisPool);
+                }
+            }
+
+            if (bestMatch != null)
+            {
+                demand.IsAssigned = true;
+
+                // Update the specific stock piece object that was matched in the current pool
+                // (which could be an original piece or a virtual leftover piece)
+                ReclaimedStockElement matchedStockInPool = bestMatch.Stock; 
+                matchedStockInPool.CurrentLeftoverLength -= demand.Length;
+                // Note: We don't add to matchedStockInPool.AssignedDemands if it's a virtual leftover,
+                // because the demand should be associated with the *original* stock piece.
+
+                // ALWAYS update the corresponding master stock piece
+                ReclaimedStockElement masterStockToUpdate = masterStockUpdateDict[matchedStockInPool.OriginalID]; // OriginalID links virtual to master
+                if (!isRepackingPass) // If Pass 1, this is the same object as matchedStockInPool
+                {
+                     // CurrentLeftoverLength was already updated if masterStockToUpdate === matchedStockInPool
+                }
+                else // If re-packing, update the master's leftover length based on the cut from the virtual piece
+                {
+                    masterStockToUpdate.CurrentLeftoverLength -= demand.Length; // Reduce master's leftover too
+                }
+                masterStockToUpdate.AssignedDemands.Add(demand); // Add to the *master* stock's list
+                masterStockToUpdate.IsUsedAtAll = true; // Ensure master is marked as used
+                
+                // Mark the piece in the current pool as used (for this pass's logic)
+                matchedStockInPool.IsUsedAtAll = true; 
+            }
+        }
+    }
+
+
+    // =============================================================================================
+    // Helper Methods: Loading Data (Assumed Unchanged - provide if needed)
+    // =============================================================================================
+    private List<DemandElement> LoadDemands(DataTree<double> bank)
+    {
+        var elements = new List<DemandElement>();
+        if (bank == null || bank.BranchCount < 5 || bank.DataCount == 0) 
+        { if(bank != null && bank.DataCount > 0 && bank.BranchCount < 5) AddRuntimeMessage(GH_RuntimeMessageLevel.Warning, "DemandBank has data but fewer than 5 branches."); return elements; }
+        try { List<double> ids = bank.Branch(0).Select(x => x).ToList(); List<double> lengths = bank.Branch(1).Select(x => x).ToList(); List<double> heights = bank.Branch(2).Select(x => x).ToList(); List<double> widths = bank.Branch(3).Select(x => x).ToList(); List<double> classes = bank.Branch(4).Select(x => x).ToList(); int count = ids.Count; if (lengths.Count != count || heights.Count != count || widths.Count != count || classes.Count != count) { AddRuntimeMessage(GH_RuntimeMessageLevel.Error, "Demand Bank data lists have mismatched counts."); return elements; } for (int i = 0; i < count; i++) { elements.Add(new DemandElement { OriginalID = (int)ids[i], Length = lengths[i], Height = heights[i], Width = widths[i], StrengthClass = (int)classes[i] }); } }
+        catch (Exception ex) { AddRuntimeMessage(GH_RuntimeMessageLevel.Error, $"Error loading demands: {ex.Message}"); } return elements;
+    }
+    private List<ReclaimedStockElement> LoadReclaimedStock(DataTree<double> bank)
+    {
+        var elements = new List<ReclaimedStockElement>();
+        if (bank == null || bank.BranchCount < 5 || bank.DataCount == 0)
+        { if(bank != null && bank.DataCount > 0 && bank.BranchCount < 5) AddRuntimeMessage(GH_RuntimeMessageLevel.Warning, "ReclaimedStockBank has data but fewer than 5 branches."); return elements; }
+        try { List<double> ids = bank.Branch(0).Select(x => x).ToList(); List<double> lengths = bank.Branch(1).Select(x => x).ToList(); List<double> heights = bank.Branch(2).Select(x => x).ToList(); List<double> widths = bank.Branch(3).Select(x => x).ToList(); List<double> classes = bank.Branch(4).Select(x => x).ToList(); int count = ids.Count; if (lengths.Count != count || heights.Count != count || widths.Count != count || classes.Count != count) { AddRuntimeMessage(GH_RuntimeMessageLevel.Error, "Reclaimed Stock Bank data lists have mismatched counts."); return elements; } var idGroups = ids.GroupBy(idVal => (int)idVal); var duplicateIds = idGroups.Where(g => g.Count() > 1).Select(g => g.Key).ToList(); if (duplicateIds.Any()) { AddRuntimeMessage(GH_RuntimeMessageLevel.Error, $"Duplicate OriginalIDs in ReclaimedStockBank: {string.Join(", ", duplicateIds)}. IDs must be unique.");} for (int i = 0; i < count; i++) { elements.Add(new ReclaimedStockElement { OriginalID = (int)ids[i], OriginalLength = lengths[i], CurrentLeftoverLength = lengths[i], Height = heights[i], Width = widths[i], StrengthClass = (int)classes[i] }); } }
+        catch (Exception ex) { AddRuntimeMessage(GH_RuntimeMessageLevel.Error, $"Error loading reclaimed stock: {ex.Message}"); } return elements;
+    }
+
+    // =============================================================================================
+    // Helper Methods: Matching Logic (FindBestFit, CalculateMatchScore - Assumed Unchanged)
+    // =============================================================================================
+    private PotentialMatch FindBestFit(DemandElement demand, List<ReclaimedStockElement> availableStock)
+    {
+        List<PotentialMatch> possibleMatches = new List<PotentialMatch>();
+        foreach (ReclaimedStockElement stock in availableStock) { if (stock.CurrentLeftoverLength < demand.Length) continue; if (stock.Width < demand.Width) continue; if (stock.Height < demand.Height) continue; if (stock.StrengthClass < demand.StrengthClass) continue; double stockArea = stock.CrossSectionalArea; double demandArea = demand.CrossSectionalArea; if (demandArea <= 1e-6 && stockArea > 1e-6) continue; if (demandArea <= 1e-6 && stockArea <= 1e-6) {} else if (demandArea <= 1e-6) continue; double areaRatio = (demandArea > 1e-6) ? stockArea / demandArea : 1.0; if (areaRatio > MAX_STOCK_TO_DEMAND_AREA_RATIO && demandArea > 1e-6) continue; double score = CalculateMatchScore(demand, stock, areaRatio); possibleMatches.Add(new PotentialMatch { Demand = demand, Stock = stock, Score = score }); }
+        if (!possibleMatches.Any()) return null; return possibleMatches.OrderByDescending(m => m.Score).First();
+    }
+    private double CalculateMatchScore(DemandElement demand, ReclaimedStockElement stock, double areaRatio)
+    {
+        double leftoverScore = -(stock.CurrentLeftoverLength - demand.Length); double crossSectionScore = (areaRatio > 1e-6) ? (1.0 / areaRatio) : 0; double strengthClassDifference = stock.StrengthClass - demand.StrengthClass; double strengthScore = -strengthClassDifference; return (leftoverScore * 1000) + (crossSectionScore * 100) + (strengthScore * 10);
+    }
+
+    // =============================================================================================
+    // Helper Methods: Output Generation (Unchanged from your last request)
+    // =============================================================================================
+    private DataTree<object> CreateOutputForMatched(List<ReclaimedStockElement> usedStockPieces)
+    {
+        var tree = new DataTree<object>(); var p0 = new List<object>(); var p1 = new List<object>(); var p2 = new List<object>(); var p3 = new List<object>(); var p4 = new List<object>(); var p5 = new List<object>(); var p6 = new List<object>();
+        foreach (ReclaimedStockElement stock in usedStockPieces.OrderBy(s => s.OriginalID)) { if (!stock.AssignedDemands.Any()) continue; double finalStockLeftover = stock.CurrentLeftoverLength; foreach (DemandElement demand in stock.AssignedDemands.OrderBy(d => d.OriginalID)) { p0.Add(stock.OriginalID); p1.Add(demand.OriginalID); p2.Add(finalStockLeftover); p3.Add(stock.OriginalLength); p4.Add(stock.Height); p5.Add(stock.Width); p6.Add(stock.StrengthClass); } }
+        if (p0.Any()) { tree.AddRange(p0, new GH_Path(0)); tree.AddRange(p1, new GH_Path(1)); tree.AddRange(p2, new GH_Path(2)); tree.AddRange(p3, new GH_Path(3)); tree.AddRange(p4, new GH_Path(4)); tree.AddRange(p5, new GH_Path(5)); tree.AddRange(p6, new GH_Path(6)); } return tree;
+    }
+    private DataTree<object> CreateOutputForUnmatched(List<DemandElement> unmatchedDemands, int startingId)
+    {
+        var tree = new DataTree<object>(); var p0=new List<object>();var p1=new List<object>();var p2=new List<object>();var p3=new List<object>();var p4=new List<object>();var p5=new List<object>();var p6=new List<object>(); int nextOutputId = startingId + 1;
+        foreach (DemandElement demand in unmatchedDemands.OrderBy(d => d.OriginalID)) { p0.Add(nextOutputId); p1.Add(demand.OriginalID); p2.Add(0.0); p3.Add(demand.Length); p4.Add(demand.Height); p5.Add(demand.Width); p6.Add(demand.StrengthClass); nextOutputId++; }
+        if (p0.Any()) { tree.AddRange(p0, new GH_Path(0)); tree.AddRange(p1, new GH_Path(1)); tree.AddRange(p2, new GH_Path(2)); tree.AddRange(p3, new GH_Path(3)); tree.AddRange(p4, new GH_Path(4)); tree.AddRange(p5, new GH_Path(5)); tree.AddRange(p6, new GH_Path(6)); } return tree;
+    }
+}

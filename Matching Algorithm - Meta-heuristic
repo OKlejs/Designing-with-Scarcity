@@ -1,0 +1,1006 @@
+#region Usings
+using System;
+using System.Linq;
+using System.Collections;
+using System.Collections.Generic;
+using System.Drawing;
+
+using Rhino;
+using Rhino.Geometry;
+
+using Grasshopper;
+using Grasshopper.Kernel;
+using Grasshopper.Kernel.Data;
+using Grasshopper.Kernel.Types;
+#endregion
+
+public class Script_Instance : GH_ScriptInstance
+{
+  // =============================================================================================
+  // CONFIGURATION CONSTANTS
+  // =============================================================================================
+  // These are now input parameters instead of constants
+  // private const double MIN_CROSS_SECTION_RATIO = 0.6; // Demand must use at least 30% of stock's cross-section
+  // private const double CROSS_SECTION_TOLERANCE = 0.2; // 20% tolerance for cross-section compatibility
+  
+  // =============================================================================================
+  // HELPER DATA STRUCTURES
+  // =============================================================================================
+
+  /// <summary>
+  /// Represents a demand item to be cut from stock
+  /// </summary>
+  class Demand
+  {
+    public int ID { get; set; }
+    public double Length { get; set; }
+    public double Width { get; set; }
+    public double Height { get; set; }
+    public double Class { get; set; }
+    public bool IsAssigned { get; set; } = false;
+    
+    // Calculate volume of the demand
+    public double Volume => Length * Width * Height;
+  }
+  
+  /// <summary>
+  /// Represents a stock piece (either reclaimed or market)
+  /// </summary>
+  class StockPiece
+  {
+    public int ID { get; set; }
+    public double OriginalLength { get; set; }
+    public double Leftover { get; set; }
+    public double Width { get; set; }
+    public double Height { get; set; }
+    public double Class { get; set; }
+    public bool IsReclaimed { get; set; }
+    public bool IsUsed { get; set; } = false;
+    public List<int> MatchedDemands { get; set; } = new List<int>();
+    
+    // Calculate original volume of the stock piece
+    public double OriginalVolume => OriginalLength * Width * Height;
+    
+    // Calculate remaining volume of the stock piece
+    public double RemainingVolume => Leftover * Width * Height;
+    
+    // Calculate used volume based on original vs remaining
+    public double UsedVolume => OriginalVolume - RemainingVolume;
+    
+    // For creating a market instance from a template with a new ID
+    public StockPiece Clone(int newId)
+    {
+      return new StockPiece
+      {
+        ID = newId,
+        OriginalLength = this.OriginalLength,
+        Leftover = this.OriginalLength, // Reset to full length
+        Width = this.Width,
+        Height = this.Height,
+        Class = this.Class,
+        IsReclaimed = false // New instances are always market pieces
+      };
+    }
+    
+    // Check if this stock can fit the demand
+    public bool CanFit(Demand demand)
+    {
+      return Leftover >= demand.Length && 
+             Width >= demand.Width && 
+             Height >= demand.Height && 
+             Class >= demand.Class;
+    }
+  }
+  
+  /// <summary>
+  /// Represents a potential assignment of demands to a stock piece
+  /// </summary>
+  struct Assignment
+  {
+    public StockPiece Stock;
+    public List<int> DemandIds;
+    public double RemainingLength;
+    
+    // Calculate volume-based utilization (used volume / original volume)
+    public double Utilization => 
+      (Stock.OriginalLength - RemainingLength) * Stock.Width * Stock.Height / 
+      (Stock.OriginalLength * Stock.Width * Stock.Height);
+    
+    // Calculate the remaining volume
+    public double RemainingVolume => RemainingLength * Stock.Width * Stock.Height;
+  }
+  
+  // =============================================================================================
+  // MAIN SCRIPT
+  // =============================================================================================
+  private void RunScript(
+		DataTree<double> DemandBank,
+		DataTree<double> ReclaimedBank,
+		DataTree<double> MarketBank,
+		double crossSectionThreshold,
+		double packingTolerance,
+		ref object ReclaimedMatches,
+		ref object MarketMatches)   
+  {
+    // Use input parameters instead of constants
+    double MIN_CROSS_SECTION_RATIO = crossSectionThreshold;
+    double CROSS_SECTION_TOLERANCE = packingTolerance;
+    
+    // Step 1: Load all data
+    var demands = LoadDemands(DemandBank);
+    var reclaimedStock = LoadStockPieces(ReclaimedBank, true);
+    var marketTemplates = LoadStockPieces(MarketBank, false);
+    
+    // We'll track pieces that get used
+    var usedReclaimed = new List<StockPiece>();
+    var usedMarket = new List<StockPiece>();
+    
+    // Dictionary for faster demand lookup
+    var demandDict = demands.ToDictionary(d => d.ID, d => d);
+    
+    // Start ID numbering for market pieces from the highest reclaimed stock ID + 1
+    // This ensures market IDs continue from where reclaimed IDs end
+    int nextId = 1; // Default start if no reclaimed stock
+    
+    // Get the highest ID from reclaimed stock
+    if (reclaimedStock.Count > 0)
+    {
+      nextId = reclaimedStock.Max(r => r.ID) + 1;
+    }
+    
+    // Store default market dimensions if we have any market templates
+    double defaultMarketWidth = 0;
+    double defaultMarketHeight = 0;
+    double defaultMarketClass = 0;
+    
+    if (marketTemplates.Count > 0)
+    {
+      // Use the largest dimensions from available templates
+      defaultMarketWidth = marketTemplates.Max(m => m.Width);
+      defaultMarketHeight = marketTemplates.Max(m => m.Height);
+      defaultMarketClass = marketTemplates.Max(m => m.Class);
+    }
+    else if (reclaimedStock.Count > 0)
+    {
+      // If no market templates but have reclaimed, use the largest dimensions from reclaimed
+      defaultMarketWidth = reclaimedStock.Max(m => m.Width);
+      defaultMarketHeight = reclaimedStock.Max(m => m.Height);
+      defaultMarketClass = reclaimedStock.Max(m => m.Class);
+    }
+    else
+    {
+      // If no templates at all, we'll use dimensions based on demands below
+      defaultMarketWidth = 0;
+      defaultMarketHeight = 0;
+      defaultMarketClass = 0;
+    }
+    
+    // Group demands by class for more efficient processing
+    var demandsByClass = GroupByClass(demands);
+    
+    // Index reclaimed stock by class for faster lookup
+    var reclaimedByClass = IndexByClass(reclaimedStock);
+    
+    // Index market templates by class for faster lookup
+    var marketByClass = IndexByClass(marketTemplates);
+    
+    // Get distinct classes for systematic processing
+    var allClasses = demandsByClass.Keys
+      .Concat(reclaimedByClass.Keys)
+      .Concat(marketByClass.Keys)
+      .Distinct()
+      .OrderBy(c => c)
+      .ToList();
+    
+    // Step 2: First pass - Process reclaimed stock with best-fit
+    // Process classes in ascending order (lower classes first)
+    foreach (var cls in allClasses)
+    {
+      // Get demands for this class and lower (we can upgrade)
+      var classDemandsQuery = allClasses
+        .Where(c => c <= cls)
+        .SelectMany(c => demandsByClass.ContainsKey(c) ? demandsByClass[c] : new List<Demand>());
+      
+      var classDemands = classDemandsQuery
+        .Where(d => !d.IsAssigned)
+        .OrderByDescending(d => d.Volume) // Sort by descending volume for better 3D packing
+        .ToList();
+      
+      // Get reclaimed pieces of this class or higher
+      var classPiecesQuery = allClasses
+        .Where(c => c >= cls)
+        .SelectMany(c => reclaimedByClass.ContainsKey(c) ? reclaimedByClass[c] : new List<StockPiece>());
+      
+      var classPieces = classPiecesQuery
+        .Where(p => !p.IsUsed)
+        .ToList();
+      
+      // For each demand, find best reclaimed piece
+      foreach (var demand in classDemands)
+      {
+        if (demand.IsAssigned)
+          continue;
+        
+        // First try to fit into existing used pieces (maximizes utilization)
+        if (TryFitDemandIntoExistingStock(demand, usedReclaimed, MIN_CROSS_SECTION_RATIO))
+          continue;
+        
+        // Try to find the best unused reclaimed piece
+        var bestAssignment = FindBestReclaimedAssignment(demand, classPieces, demands, MIN_CROSS_SECTION_RATIO, CROSS_SECTION_TOLERANCE);
+        if (bestAssignment.Stock != null)
+        {
+          // Apply the assignment
+          bestAssignment.Stock.IsUsed = true;
+          bestAssignment.Stock.Leftover = bestAssignment.RemainingLength;
+          
+          foreach (var dId in bestAssignment.DemandIds)
+          {
+            demandDict[dId].IsAssigned = true;
+            bestAssignment.Stock.MatchedDemands.Add(dId);
+          }
+          
+          usedReclaimed.Add(bestAssignment.Stock);
+        }
+      }
+    }
+    
+    // Step 3: Process remaining demands with market pieces using the same optimization approach
+    var unassignedDemands = demands.Where(d => !d.IsAssigned)
+      .OrderByDescending(d => d.Volume) // Sort by volume
+      .ToList();
+    
+    // Create a list to track which market templates have been used
+    var marketInstanceCounter = new Dictionary<int, int>();
+    foreach (var template in marketTemplates)
+    {
+      marketInstanceCounter[template.ID] = 0;
+    }
+    
+    // Process classes in ascending order for market templates too
+    foreach (var cls in allClasses)
+    {
+      // Get demands for this class and lower (we can upgrade)
+      var classDemandsQuery = allClasses
+        .Where(c => c <= cls)
+        .SelectMany(c => demandsByClass.ContainsKey(c) ? demandsByClass[c] : new List<Demand>());
+      
+      var classDemands = classDemandsQuery
+        .Where(d => !d.IsAssigned)
+        .OrderByDescending(d => d.Volume) // Sort by descending volume for better 3D packing
+        .ToList();
+      
+      if (classDemands.Count == 0)
+        continue;
+        
+      // Get market templates of this class or higher
+      var classTemplatesQuery = allClasses
+        .Where(c => c >= cls)
+        .SelectMany(c => marketByClass.ContainsKey(c) ? marketByClass[c] : new List<StockPiece>());
+      
+      var classTemplates = classTemplatesQuery.ToList();
+      
+      // IMPORTANT: If we have no market templates but still have unassigned demands,
+      // create a new "generic" market template that can fit the remaining demands
+      if (classTemplates.Count == 0 && classDemands.Count > 0)
+      {
+        // Find the maximum dimensions needed for all unassigned demands
+        double maxLength = classDemands.Max(d => d.Length);
+        
+        // If we don't have default market dimensions yet, get them from demands
+        if (defaultMarketWidth == 0)
+        {
+          defaultMarketWidth = classDemands.Max(d => d.Width) * 1.1;
+          defaultMarketHeight = classDemands.Max(d => d.Height) * 1.1;
+          defaultMarketClass = classDemands.Max(d => d.Class);
+        }
+        
+        // Create a generic market template with appropriate dimensions
+        var genericTemplate = new StockPiece
+        {
+          ID = nextId++,
+          OriginalLength = maxLength * 2, // Make it big enough for multiple demands
+          Leftover = maxLength * 2,
+          Width = defaultMarketWidth,
+          Height = defaultMarketHeight,
+          Class = defaultMarketClass,
+          IsReclaimed = false
+        };
+        
+        classTemplates.Add(genericTemplate);
+        marketTemplates.Add(genericTemplate);
+        
+        // Add to the instance counter
+        marketInstanceCounter[genericTemplate.ID] = 0;
+        
+        // Update market by class index
+        if (!marketByClass.ContainsKey(genericTemplate.Class))
+        {
+          marketByClass[genericTemplate.Class] = new List<StockPiece>();
+        }
+        marketByClass[genericTemplate.Class].Add(genericTemplate);
+      }
+      
+      // For each demand, find the best market template
+      foreach (var demand in classDemands)
+      {
+        if (demand.IsAssigned)
+          continue;
+        
+        // First try to fit into existing used market pieces (maximizes utilization)
+        if (TryFitDemandIntoExistingStock(demand, usedMarket, MIN_CROSS_SECTION_RATIO))
+        {
+          demand.IsAssigned = true;
+          continue;
+        }
+        
+        // Try to find the best market assignment from available templates
+        var bestAssignment = FindBestMarketAssignment(demand, classTemplates, demands, MIN_CROSS_SECTION_RATIO, CROSS_SECTION_TOLERANCE);
+        
+        if (bestAssignment.Stock != null)
+        {
+          // Create a new instance from the template with a NEW unique ID
+          var templateId = bestAssignment.Stock.ID;
+          var instanceCount = ++marketInstanceCounter[templateId];
+          
+          // Clone the template but assign a new unique ID
+          var newInstance = bestAssignment.Stock.Clone(nextId++);
+          
+          // Apply the assignment
+          newInstance.Leftover = bestAssignment.RemainingLength;
+          newInstance.IsUsed = true;
+          
+          foreach (var dId in bestAssignment.DemandIds)
+          {
+            demandDict[dId].IsAssigned = true;
+            newInstance.MatchedDemands.Add(dId);
+          }
+          
+          usedMarket.Add(newInstance);
+        }
+        else
+        {
+          // If no suitable template, find the best market stock dimensions to use
+          double requiredLength = demand.Length * 1.1; // Add 10% buffer
+          
+          // Find the best available market stock dimensions
+          StockPiece bestDimensionTemplate = null;
+          double bestCrossSectionRatio = 0;
+          
+          // First try to find an existing market template with good cross-section match
+          if (marketTemplates.Count > 0)
+          {
+            foreach (var template in marketTemplates)
+            {
+              // Check if this template's dimensions can fit the demand
+              if (template.Width >= demand.Width && template.Height >= demand.Height)
+              {
+                double crossSectionRatio = (demand.Width * demand.Height) / (template.Width * template.Height);
+                
+                // If this template has better cross-section ratio, use it
+                if (crossSectionRatio >= MIN_CROSS_SECTION_RATIO && crossSectionRatio > bestCrossSectionRatio)
+                {
+                  bestDimensionTemplate = template;
+                  bestCrossSectionRatio = crossSectionRatio;
+                }
+              }
+            }
+          }
+          
+          // If we found a good template, use its dimensions
+          double customWidth, customHeight, customClass;
+          
+          if (bestDimensionTemplate != null)
+          {
+            customWidth = bestDimensionTemplate.Width;
+            customHeight = bestDimensionTemplate.Height;
+            customClass = bestDimensionTemplate.Class;
+          }
+          else if (defaultMarketWidth > 0 && defaultMarketHeight > 0)
+          {
+            // Use default market dimensions if they exist
+            customWidth = defaultMarketWidth;
+            customHeight = defaultMarketHeight;
+            customClass = defaultMarketClass > 0 ? defaultMarketClass : demand.Class;
+            
+            // Check cross-section ratio with default dimensions
+            double crossSectionRatio = (demand.Width * demand.Height) / (customWidth * customHeight);
+            
+            // If cross-section ratio is too low with default dimensions, create a custom size
+            if (crossSectionRatio < MIN_CROSS_SECTION_RATIO)
+            {
+              // Create custom dimensions with minimal waste
+              customWidth = demand.Width * 1.1;
+              customHeight = demand.Height * 1.1;
+            }
+          }
+          else
+          {
+            // No market templates or defaults, create custom dimensions
+            customWidth = demand.Width * 1.1;
+            customHeight = demand.Height * 1.1;
+            customClass = demand.Class;
+          }
+          
+          var customPiece = new StockPiece
+          {
+            ID = nextId,
+            OriginalLength = requiredLength,
+            Leftover = requiredLength - demand.Length,
+            Width = customWidth,
+            Height = customHeight,
+            Class = defaultMarketClass > 0 ? defaultMarketClass : demand.Class,
+            IsReclaimed = false,
+            IsUsed = true
+          };
+          
+          // Add to templates so it can be reused
+          marketTemplates.Add(customPiece);
+          marketInstanceCounter[nextId] = 1;
+          nextId++;
+          
+          // Update classification
+          if (!marketByClass.ContainsKey(customPiece.Class))
+          {
+            marketByClass[customPiece.Class] = new List<StockPiece>();
+          }
+          marketByClass[customPiece.Class].Add(customPiece);
+          
+          // Assign demand
+          customPiece.MatchedDemands.Add(demand.ID);
+          demand.IsAssigned = true;
+          
+          usedMarket.Add(customPiece);
+        }
+      }
+    }
+    
+    // Check if any demands remain unassigned (should not happen, but safety check)
+    var finalUnassigned = demands.Where(d => !d.IsAssigned).ToList();
+    if (finalUnassigned.Count > 0)
+    {
+      // Handle any remaining with custom pieces optimized for cross-section
+      foreach (var demand in finalUnassigned)
+      {
+        // Create a custom piece with minimal waste - just slightly larger than the demand
+        // This is our fallback option for demands that couldn't be assigned otherwise
+        double requiredLength = demand.Length * 1.05; // 5% buffer
+        double optimalWidth = demand.Width * 1.05;    // 5% buffer
+        double optimalHeight = demand.Height * 1.05;  // 5% buffer
+        
+        var customPiece = new StockPiece
+        {
+          ID = nextId++,
+          OriginalLength = requiredLength,
+          Leftover = requiredLength - demand.Length,
+          Width = optimalWidth,
+          Height = optimalHeight,
+          Class = demand.Class,
+          IsReclaimed = false,
+          IsUsed = true
+        };
+        
+        customPiece.MatchedDemands.Add(demand.ID);
+        demand.IsAssigned = true;
+        
+        usedMarket.Add(customPiece);
+      }
+    }
+    
+    // Step 4: Generate output
+    ReclaimedMatches = GenerateReclaimedOutput(usedReclaimed);
+    MarketMatches = GenerateMarketOutput(usedMarket, demands);
+  }
+  
+  // =============================================================================================
+  // HELPER METHODS
+  // =============================================================================================
+  
+  /// <summary>
+  /// Group a list of items by their class
+  /// </summary>
+  private Dictionary<double, List<T>> GroupByClass<T>(List<T> items) where T : class
+  {
+    var result = new Dictionary<double, List<T>>();
+    var prop = typeof(T).GetProperty("Class");
+    
+    foreach (var item in items)
+    {
+      double cls = (double)prop.GetValue(item);
+      if (!result.ContainsKey(cls))
+      {
+        result[cls] = new List<T>();
+      }
+      result[cls].Add(item);
+    }
+    
+    return result;
+  }
+  
+  /// <summary>
+  /// Index stock pieces by class for faster lookup
+  /// </summary>
+  private Dictionary<double, List<StockPiece>> IndexByClass(List<StockPiece> stock)
+  {
+    var result = new Dictionary<double, List<StockPiece>>();
+    foreach (var piece in stock)
+    {
+      if (!result.ContainsKey(piece.Class))
+      {
+        result[piece.Class] = new List<StockPiece>();
+      }
+      result[piece.Class].Add(piece);
+    }
+    return result;
+  }
+  
+  /// <summary>
+  /// Loads demand data from input tree
+  /// </summary>
+  private List<Demand> LoadDemands(DataTree<double> demandBank)
+  {
+    List<double> ids = demandBank.Branch(0);
+    List<double> lengths = demandBank.Branch(1);
+    List<double> heights = demandBank.Branch(2);
+    List<double> widths = demandBank.Branch(3);
+    List<double> classes = demandBank.Branch(4);
+    
+    var demands = new List<Demand>();
+    for (int i = 0; i < ids.Count; i++)
+    {
+      demands.Add(new Demand
+      {
+        ID = (int)ids[i],
+        Length = lengths[i],
+        Width = widths[i],
+        Height = heights[i],
+        Class = classes[i]
+      });
+    }
+    return demands;
+  }
+  
+  /// <summary>
+  /// Loads stock pieces from input tree
+  /// </summary>
+  private List<StockPiece> LoadStockPieces(DataTree<double> stockBank, bool isReclaimed)
+  {
+    // Check if the tree is empty
+    if (stockBank == null || stockBank.BranchCount == 0 || stockBank.DataCount == 0)
+      return new List<StockPiece>();
+      
+    List<double> ids = stockBank.Branch(0);
+    List<double> lengths = stockBank.Branch(1);
+    List<double> heights = stockBank.Branch(2);
+    List<double> widths = stockBank.Branch(3);
+    List<double> classes = stockBank.Branch(4);
+    
+    var stock = new List<StockPiece>();
+    for (int i = 0; i < ids.Count; i++)
+    {
+      stock.Add(new StockPiece
+      {
+        ID = (int)ids[i],
+        OriginalLength = lengths[i],
+        Leftover = lengths[i],
+        Width = widths[i],
+        Height = heights[i],
+        Class = classes[i],
+        IsReclaimed = isReclaimed
+      });
+    }
+    return stock;
+  }
+  
+  /// <summary>
+  /// Try to fit a demand into an existing stock piece with best volumetric fit
+  /// and cross-section optimization
+  /// </summary>
+  private bool TryFitDemandIntoExistingStock(Demand demand, List<StockPiece> stockList, double minCrossSectionRatio)
+  {
+    // First find all eligible pieces with minimum cross-section ratio
+    var eligible = stockList
+      .Where(s => s.CanFit(demand))
+      .Where(s => {
+        double crossSectionRatio = (demand.Width * demand.Height) / (s.Width * s.Height);
+        return crossSectionRatio >= minCrossSectionRatio;
+      })
+      .ToList();
+      
+    if (eligible.Count == 0)
+      return false;
+      
+    // Calculate expected volume utilization for each candidate
+    var candidates = eligible.Select(stock => new {
+      Stock = stock,
+      // Calculate volume utilization if we add this demand
+      CurrentUtilization = stock.UsedVolume / stock.OriginalVolume,
+      NewUtilization = (stock.UsedVolume + demand.Volume) / stock.OriginalVolume,
+      UtilizationImprovement = (stock.UsedVolume + demand.Volume) / stock.OriginalVolume - stock.UsedVolume / stock.OriginalVolume,
+      // Volume ratio looks at how well the demand's cross-section matches the stock's cross-section
+      CrossSectionRatio = (demand.Width * demand.Height) / (stock.Width * stock.Height)
+    }).ToList();
+      
+    // Find best fit considering:
+    // 1. The improvement in utilization (primary sort)
+    // 2. The cross section matching (secondary sort for similar utilization improvements)
+    var bestFit = candidates
+      .OrderByDescending(c => c.UtilizationImprovement)
+      .ThenByDescending(c => c.CrossSectionRatio)
+      .First().Stock;
+      
+    // Assign the demand
+    bestFit.MatchedDemands.Add(demand.ID);
+    bestFit.Leftover -= demand.Length;
+    demand.IsAssigned = true;
+    
+    return true;
+  }
+  
+  /// <summary>
+  /// Find the best reclaimed piece assignment for a demand based on volume utilization
+  /// and cross-section optimization
+  /// </summary>
+  private Assignment FindBestReclaimedAssignment(
+    Demand lead, 
+    List<StockPiece> availableStock,
+    List<Demand> allDemands,
+    double minCrossSectionRatio,
+    double crossSectionTolerance)
+  {
+    // Filter based on cross-section ratio first
+    var eligibleStock = availableStock
+      .Where(s => s.CanFit(lead))
+      .Where(s => {
+        double crossSectionRatio = (lead.Width * lead.Height) / (s.Width * s.Height);
+        return crossSectionRatio >= minCrossSectionRatio;
+      })
+      .ToList();
+      
+    // If no pieces available or demand doesn't fit any, return empty assignment
+    if (eligibleStock.Count == 0)
+    {
+      return new Assignment
+      {
+        Stock = null,
+        DemandIds = new List<int>(),
+        RemainingLength = 0
+      };
+    }
+    
+    Assignment bestAssignment = new Assignment
+    {
+      Stock = null,
+      DemandIds = new List<int>(),
+      RemainingLength = double.MaxValue
+    };
+    
+    double bestVolumeUtilization = 0;
+    double bestCrossSectionRatio = 0;
+    
+    // Try each eligible stock piece
+    foreach (var stock in eligibleStock)
+    {
+      // Simulate placing this demand and others that might fit
+      var assignment = SimulateOptimalGrouping(lead, stock, allDemands, minCrossSectionRatio, crossSectionTolerance);
+      
+      // Calculate cross-section ratio between lead demand and stock
+      double crossSectionRatio = (lead.Width * lead.Height) / (stock.Width * stock.Height);
+      
+      // Choose assignment with best utilization, breaking ties with cross-section match
+      if (bestAssignment.Stock == null || 
+          assignment.Utilization > bestVolumeUtilization ||
+          (Math.Abs(assignment.Utilization - bestVolumeUtilization) < 1e-6 && 
+           crossSectionRatio > bestCrossSectionRatio))
+      {
+        bestAssignment = assignment;
+        bestVolumeUtilization = assignment.Utilization;
+        bestCrossSectionRatio = crossSectionRatio;
+      }
+    }
+    
+    return bestAssignment;
+  }
+  
+  /// <summary>
+  /// Find the best market template assignment using the same optimization approach as reclaimed
+  /// </summary>
+  private Assignment FindBestMarketAssignment(
+    Demand lead, 
+    List<StockPiece> availableTemplates,
+    List<Demand> allDemands,
+    double minCrossSectionRatio,
+    double crossSectionTolerance)
+  {
+    // Filter based on cross-section ratio first
+    var eligibleTemplates = availableTemplates
+      .Where(s => s.CanFit(lead))
+      .Where(s => {
+        double crossSectionRatio = (lead.Width * lead.Height) / (s.Width * s.Height);
+        return crossSectionRatio >= minCrossSectionRatio;
+      })
+      .ToList();
+      
+    // If no templates available or demand doesn't fit any, return empty assignment
+    if (eligibleTemplates.Count == 0)
+    {
+      return new Assignment
+      {
+        Stock = null,
+        DemandIds = new List<int>(),
+        RemainingLength = 0
+      };
+    }
+    
+    Assignment bestAssignment = new Assignment
+    {
+      Stock = null,
+      DemandIds = new List<int>(),
+      RemainingLength = double.MaxValue
+    };
+    
+    double bestVolumeUtilization = 0;
+    double bestCrossSectionRatio = 0;
+    
+    // Try each eligible template
+    foreach (var template in eligibleTemplates)
+    {
+      // Simulate placing this demand and others that might fit
+      var assignment = SimulateOptimalGrouping(lead, template, allDemands, minCrossSectionRatio, crossSectionTolerance);
+      
+      // Calculate cross-section ratio between lead demand and template
+      double crossSectionRatio = (lead.Width * lead.Height) / (template.Width * template.Height);
+      
+      // Choose assignment with best utilization, breaking ties with cross-section match
+      if (bestAssignment.Stock == null || 
+          assignment.Utilization > bestVolumeUtilization ||
+          (Math.Abs(assignment.Utilization - bestVolumeUtilization) < 1e-6 && 
+           crossSectionRatio > bestCrossSectionRatio))
+      {
+        bestAssignment = assignment;
+        bestVolumeUtilization = assignment.Utilization;
+        bestCrossSectionRatio = crossSectionRatio;
+      }
+    }
+    
+    return bestAssignment;
+  }
+  
+  /// <summary>
+  /// Simulate placing demands in a stock piece to find optimal grouping by volume 
+  /// with cross-section constraints
+  /// </summary>
+  private Assignment SimulateOptimalGrouping(
+    Demand lead, 
+    StockPiece stock,
+    List<Demand> allDemands,
+    double minCrossSectionRatio,
+    double crossSectionTolerance)
+  {
+    // Start with lead demand
+    var assignment = new Assignment
+    {
+      Stock = stock,
+      DemandIds = new List<int> { lead.ID },
+      RemainingLength = stock.OriginalLength - lead.Length
+    };
+    
+    // If no remaining length, return early
+    if (assignment.RemainingLength < 1e-6)
+      return assignment;
+      
+    // Lead demand's cross-section will guide what demands we pack with it
+    double leadCrossSectionArea = lead.Width * lead.Height;
+    double stockCrossSectionArea = stock.Width * stock.Height;
+    double leadCrossSectionRatio = leadCrossSectionArea / stockCrossSectionArea;
+    
+    // Get unassigned demands that could physically fit
+    var potentialFits = allDemands
+      .Where(d => 
+        !d.IsAssigned &&
+        d.ID != lead.ID &&
+        d.Length <= assignment.RemainingLength &&
+        d.Width <= stock.Width &&
+        d.Height <= stock.Height &&
+        d.Class <= stock.Class)
+      .ToList();
+      
+    // Group demands by cross-section compatibility
+    var groupedDemands = new Dictionary<string, List<Demand>>();
+    
+    // Define standard cross-section buckets for better grouping
+    // This creates groups like "small", "medium", "large" based on ratio to stock
+    foreach (var demand in potentialFits)
+    {
+      double demandCrossSectionRatio = (demand.Width * demand.Height) / stockCrossSectionArea;
+      
+      // Skip demands with extremely poor cross-section match
+      if (demandCrossSectionRatio < minCrossSectionRatio)
+        continue;
+        
+      // Determine if this demand has similar cross-section to lead demand
+      bool isCompatibleWithLead = Math.Abs(demandCrossSectionRatio - leadCrossSectionRatio) <= crossSectionTolerance;
+      
+      // Group key based on cross-section size category
+      string groupKey;
+      if (demandCrossSectionRatio >= 0.8)
+        groupKey = "xlarge"; // >80% of stock
+      else if (demandCrossSectionRatio >= 0.6)
+        groupKey = "large";  // 60-80% of stock
+      else if (demandCrossSectionRatio >= 0.4)
+        groupKey = "medium"; // 40-60% of stock
+      else
+        groupKey = "small";  // 30-40% of stock
+      
+      // Prioritize demands compatible with lead by adding to lead-compatible group
+      if (isCompatibleWithLead)
+        groupKey = "lead_compatible";
+      
+      if (!groupedDemands.ContainsKey(groupKey))
+        groupedDemands[groupKey] = new List<Demand>();
+        
+      groupedDemands[groupKey].Add(demand);
+    }
+    
+    // Priority order for packing from highest to lowest
+    var priorityGroups = new[] {
+      "lead_compatible", // First try demands similar to lead demand
+      "xlarge",          // Then try demands that use most of the cross-section
+      "large",
+      "medium",
+      "small"            // Last resort - small cross-section
+    };
+    
+    // Ordered list to store demands ready for packing
+    var packingOrder = new List<Demand>();
+    
+    // Build packing order according to priority groups
+    foreach (var group in priorityGroups)
+    {
+      if (groupedDemands.ContainsKey(group))
+      {
+        // Sort each group internally by length for better length packing
+        var groupDemands = groupedDemands[group]
+          .OrderByDescending(d => d.Length)
+          .ToList();
+          
+        packingOrder.AddRange(groupDemands);
+      }
+    }
+    
+    // Pack demands according to the optimized order
+    foreach (var demand in packingOrder)
+    {
+      if (assignment.RemainingLength >= demand.Length)
+      {
+        assignment.DemandIds.Add(demand.ID);
+        assignment.RemainingLength -= demand.Length;
+        
+        // If perfect fit or very close, exit early
+        if (assignment.RemainingLength < 1e-6)
+          break;
+      }
+    }
+    
+    return assignment;
+  }
+  
+  /// <summary>
+  /// Generate formatted output tree for reclaimed stock (showing stock dimensions)
+  /// </summary>
+  private DataTree<string> GenerateReclaimedOutput(List<StockPiece> pieces)
+  {
+    var tree = new DataTree<string>();
+    
+    if (pieces.Count == 0)
+      return tree;
+      
+    var p0_ID   = new List<string>();
+    var p1_Dems = new List<string>();
+    var p2_Left = new List<string>();
+    var p3_Orig = new List<string>();
+    var p4_H    = new List<string>();
+    var p5_W    = new List<string>();
+    var p6_C    = new List<string>();
+    
+    // Important: Sort by ID for consistent output
+    var orderedPieces = pieces.OrderBy(p => p.ID).ToList();
+    
+    foreach (var piece in orderedPieces)
+    {
+      // Skip if no demands matched (shouldn't happen, but safety)
+      if (piece.MatchedDemands.Count == 0)
+        continue;
+        
+      p0_ID.Add(piece.ID.ToString());
+      p1_Dems.Add(string.Join(",", piece.MatchedDemands));
+      p2_Left.Add(piece.Leftover.ToString("F2"));
+      p3_Orig.Add(piece.OriginalLength.ToString("F2"));
+      
+      // For reclaimed stock, output the stock dimensions
+      p4_H.Add(piece.Height.ToString("F2"));
+      p5_W.Add(piece.Width.ToString("F2"));
+      p6_C.Add(piece.Class.ToString("F2"));
+    }
+    
+    tree.AddRange(p0_ID,   new GH_Path(0));
+    tree.AddRange(p1_Dems, new GH_Path(1));
+    tree.AddRange(p2_Left, new GH_Path(2));
+    tree.AddRange(p3_Orig, new GH_Path(3));
+    tree.AddRange(p4_H,    new GH_Path(4));
+    tree.AddRange(p5_W,    new GH_Path(5));
+    tree.AddRange(p6_C,    new GH_Path(6));
+    
+    return tree;
+  }
+  
+  /// <summary>
+  /// Generate formatted output tree for market stock (showing demand dimensions)
+  /// </summary>
+  private DataTree<string> GenerateMarketOutput(List<StockPiece> pieces, List<Demand> allDemands)
+  {
+    var tree = new DataTree<string>();
+    
+    if (pieces.Count == 0)
+      return tree;
+      
+    var p0_ID   = new List<string>();
+    var p1_Dems = new List<string>();
+    var p2_Left = new List<string>();
+    var p3_Orig = new List<string>();
+    var p4_H    = new List<string>();
+    var p5_W    = new List<string>();
+    var p6_C    = new List<string>();
+    
+    // Important: Sort by ID for consistent output
+    var orderedPieces = pieces.OrderBy(p => p.ID).ToList();
+    
+    // Create a dictionary of all demands for quick lookup
+    var demandsDict = new Dictionary<int, Demand>();
+    foreach (var demand in allDemands)
+    {
+      demandsDict[demand.ID] = demand;
+    }
+    
+    foreach (var piece in orderedPieces)
+    {
+      // Skip if no demands matched (shouldn't happen, but safety)
+      if (piece.MatchedDemands.Count == 0)
+        continue;
+        
+      p0_ID.Add(piece.ID.ToString());
+      p1_Dems.Add(string.Join(",", piece.MatchedDemands));
+      p2_Left.Add(piece.Leftover.ToString("F2"));
+      p3_Orig.Add(piece.OriginalLength.ToString("F2"));
+      
+      // Get the demand dimensions instead of stock dimensions
+      // For multiple demands, get the largest dimensions
+      double maxHeight = 0;
+      double maxWidth = 0;
+      double maxClass = 0;
+      
+      foreach (var demandId in piece.MatchedDemands)
+      {
+        if (demandsDict.ContainsKey(demandId))
+        {
+          maxHeight = Math.Max(maxHeight, demandsDict[demandId].Height);
+          maxWidth = Math.Max(maxWidth, demandsDict[demandId].Width);
+          maxClass = Math.Max(maxClass, demandsDict[demandId].Class);
+        }
+      }
+      
+      p4_H.Add(maxHeight.ToString("F2"));
+      p5_W.Add(maxWidth.ToString("F2"));
+      p6_C.Add(maxClass.ToString("F2"));
+    }
+    
+    tree.AddRange(p0_ID,   new GH_Path(0));
+    tree.AddRange(p1_Dems, new GH_Path(1));
+    tree.AddRange(p2_Left, new GH_Path(2));
+    tree.AddRange(p3_Orig, new GH_Path(3));
+    tree.AddRange(p4_H,    new GH_Path(4));
+    tree.AddRange(p5_W,    new GH_Path(5));
+    tree.AddRange(p6_C,    new GH_Path(6));
+    
+    return tree;
+  }
+}
